@@ -7,7 +7,7 @@
 
     <groupId>dev.flametrench</groupId>
     <artifactId>authz</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0-rc.1</version>
     <packaging>jar</packaging>
 
     <name>flametrench-authz</name>
@@ -46,7 +46,7 @@
         <dependency>
             <groupId>dev.flametrench</groupId>
             <artifactId>ids</artifactId>
-            <version>0.1.0</version>
+            <version>0.2.0-rc.1</version>
         </dependency>
 
         <!-- Test dependencies -->
