@@ -11,7 +11,10 @@ import org.junit.jupiter.api.TestFactory;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -173,5 +176,87 @@ class ConformanceTest {
     @TestFactory
     List<DynamicTest> formatConformance() throws IOException {
         return createTupleConformance("format.json");
+    }
+
+    // ─── v0.2: rewrite-rules conformance ───
+    //
+    // Per ADR 0007. Each test optionally declares a `rules` field; the
+    // harness instantiates the store with those rules registered before
+    // running the check.
+
+    private static Map<String, Map<String, List<RuleNode>>> parseRules(JsonNode rulesNode) {
+        if (rulesNode == null || rulesNode.isNull()) return null;
+        Map<String, Map<String, List<RuleNode>>> out = new HashMap<>();
+        Iterator<Map.Entry<String, JsonNode>> objIt = rulesNode.fields();
+        while (objIt.hasNext()) {
+            Map.Entry<String, JsonNode> objEntry = objIt.next();
+            Map<String, List<RuleNode>> relMap = new HashMap<>();
+            Iterator<Map.Entry<String, JsonNode>> relIt = objEntry.getValue().fields();
+            while (relIt.hasNext()) {
+                Map.Entry<String, JsonNode> relEntry = relIt.next();
+                List<RuleNode> nodes = new ArrayList<>();
+                for (JsonNode n : relEntry.getValue()) {
+                    nodes.add(parseRuleNode(n));
+                }
+                relMap.put(relEntry.getKey(), nodes);
+            }
+            out.put(objEntry.getKey(), relMap);
+        }
+        return out;
+    }
+
+    private static RuleNode parseRuleNode(JsonNode node) {
+        String type = node.get("type").asText();
+        return switch (type) {
+            case "this" -> new ThisNode();
+            case "computed_userset" -> new ComputedUserset(node.get("relation").asText());
+            case "tuple_to_userset" -> new TupleToUserset(
+                    node.get("tupleset_relation").asText(),
+                    node.get("computed_userset_relation").asText()
+            );
+            default -> throw new IllegalArgumentException("Unknown rule node type: " + type);
+        };
+    }
+
+    private List<DynamicTest> rewriteFixtureBlock(String fixtureName) throws IOException {
+        JsonNode fixture = loadFixture("authorization/rewrite-rules/" + fixtureName);
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[" + id + "] " + desc, () -> {
+                Map<String, Map<String, List<RuleNode>>> rules = parseRules(t.get("rules"));
+                InMemoryTupleStore store = rules != null
+                        ? InMemoryTupleStore.withRules(rules)
+                        : new InMemoryTupleStore();
+                seed(store, t.get("input").get("given_tuples"));
+                JsonNode c = t.get("input").get("check");
+                CheckResult result = store.check(
+                        c.get("subject_type").asText(),
+                        c.get("subject_id").asText(),
+                        c.get("relation").asText(),
+                        c.get("object_type").asText(),
+                        c.get("object_id").asText()
+                );
+                JsonNode expected = t.get("expected").get("result");
+                assertEquals(expected.get("allowed").asBoolean(), result.allowed());
+            }));
+        }
+        return tests;
+    }
+
+    @TestFactory
+    List<DynamicTest> rewriteComputedUsersetConformance() throws IOException {
+        return rewriteFixtureBlock("computed-userset.json");
+    }
+
+    @TestFactory
+    List<DynamicTest> rewriteTupleToUsersetConformance() throws IOException {
+        return rewriteFixtureBlock("tuple-to-userset.json");
+    }
+
+    @TestFactory
+    List<DynamicTest> rewriteEmptyRulesEqualsV01Conformance() throws IOException {
+        return rewriteFixtureBlock("empty-rules-equals-v01.json");
     }
 }

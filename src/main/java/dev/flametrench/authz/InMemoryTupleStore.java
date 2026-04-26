@@ -17,19 +17,59 @@ import java.util.Map;
 /**
  * Reference in-memory TupleStore. O(1) check() via secondary natural-key
  * index; deterministic for tests.
+ *
+ * <p>v0.2 adds optional rewrite-rule support. With {@code rules == null}
+ * the store behaves byte-identically to v0.1; with rules registered,
+ * {@code check()} evaluates them on direct-lookup miss per ADR 0007.
  */
 public class InMemoryTupleStore implements TupleStore {
 
     private final Map<String, Tuple> tuples = new LinkedHashMap<>();
     private final Map<String, String> keyIndex = new HashMap<>(); // natural-key → tup id
     private final Clock clock;
+    private final Map<String, Map<String, List<RuleNode>>> rules;
+    private final int maxDepth;
+    private final int maxFanOut;
 
     public InMemoryTupleStore() {
-        this(Clock.systemUTC());
+        this(Clock.systemUTC(), null,
+                RewriteRulesEvaluator.DEFAULT_MAX_DEPTH,
+                RewriteRulesEvaluator.DEFAULT_MAX_FAN_OUT);
     }
 
     public InMemoryTupleStore(Clock clock) {
+        this(clock, null,
+                RewriteRulesEvaluator.DEFAULT_MAX_DEPTH,
+                RewriteRulesEvaluator.DEFAULT_MAX_FAN_OUT);
+    }
+
+    /**
+     * v0.2 constructor: register rewrite rules at construction time.
+     *
+     * @param rules nested map of (objectType -> relation -> rule). null
+     *              means no rules; behavior is identical to v0.1.
+     */
+    public InMemoryTupleStore(
+            Clock clock,
+            Map<String, Map<String, List<RuleNode>>> rules,
+            int maxDepth,
+            int maxFanOut
+    ) {
         this.clock = clock;
+        this.rules = rules;
+        this.maxDepth = maxDepth;
+        this.maxFanOut = maxFanOut;
+    }
+
+    /** Convenience: rules with system-UTC clock and spec-floor limits. */
+    public static InMemoryTupleStore withRules(
+            Map<String, Map<String, List<RuleNode>>> rules
+    ) {
+        return new InMemoryTupleStore(
+                Clock.systemUTC(), rules,
+                RewriteRulesEvaluator.DEFAULT_MAX_DEPTH,
+                RewriteRulesEvaluator.DEFAULT_MAX_FAN_OUT
+        );
     }
 
     private static String naturalKey(
@@ -135,9 +175,57 @@ public class InMemoryTupleStore implements TupleStore {
             String objectType,
             String objectId
     ) {
+        // v0.1 fast path: direct natural-key lookup. Returns immediately
+        // on a direct hit regardless of whether rules are registered.
         String key = naturalKey(subjectType, subjectId, relation, objectType, objectId);
         String tupId = keyIndex.get(key);
-        return tupId == null ? CheckResult.denied() : CheckResult.allowed(tupId);
+        if (tupId != null) {
+            return CheckResult.allowed(tupId);
+        }
+
+        // v0.2 path: rule expansion only on direct miss AND rules registered.
+        if (rules == null) {
+            return CheckResult.denied();
+        }
+
+        var result = RewriteRulesEvaluator.evaluate(
+                rules,
+                subjectType, subjectId,
+                relation, objectType, objectId,
+                this::directLookup,
+                this::listByObject,
+                maxDepth,
+                maxFanOut
+        );
+        return result.allowed()
+                ? CheckResult.allowed(result.matchedTupleId())
+                : CheckResult.denied();
+    }
+
+    /** Direct natural-key lookup callback for the rule evaluator. */
+    private String directLookup(
+            String subjectType,
+            String subjectId,
+            String relation,
+            String objectType,
+            String objectId
+    ) {
+        return keyIndex.get(naturalKey(subjectType, subjectId, relation, objectType, objectId));
+    }
+
+    /** List tuples on an object filtered by relation, for tuple_to_userset. */
+    private List<RewriteRulesEvaluator.SubjectRef> listByObject(
+            String objectType, String objectId, String relation
+    ) {
+        List<RewriteRulesEvaluator.SubjectRef> out = new ArrayList<>();
+        for (Tuple t : tuples.values()) {
+            if (!t.objectType().equals(objectType) || !t.objectId().equals(objectId)) continue;
+            if (relation != null && !t.relation().equals(relation)) continue;
+            out.add(new RewriteRulesEvaluator.SubjectRef(
+                    t.subjectType(), t.subjectId(), t.id()
+            ));
+        }
+        return out;
     }
 
     @Override
@@ -152,11 +240,9 @@ public class InMemoryTupleStore implements TupleStore {
             throw new EmptyRelationSetError();
         }
         for (String relation : relations) {
-            String key = naturalKey(subjectType, subjectId, relation, objectType, objectId);
-            String tupId = keyIndex.get(key);
-            if (tupId != null) {
-                return CheckResult.allowed(tupId);
-            }
+            // Reuse rule-aware check() so checkAny benefits from rewrites.
+            CheckResult r = check(subjectType, subjectId, relation, objectType, objectId);
+            if (r.allowed()) return r;
         }
         return CheckResult.denied();
     }
