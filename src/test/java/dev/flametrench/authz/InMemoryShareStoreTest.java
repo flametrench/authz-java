@@ -1,0 +1,189 @@
+// Copyright 2026 NDC Digital, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package dev.flametrench.authz;
+
+import dev.flametrench.ids.Id;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class InMemoryShareStoreTest {
+
+    private InMemoryShareStore store;
+    private String alice;
+    private String project42;
+
+    @BeforeEach
+    void setup() {
+        store = new InMemoryShareStore();
+        alice = Id.generate("usr");
+        project42 = UUID.randomUUID().toString();
+    }
+
+    @Test
+    void createShare_freshIdAndDistinctToken() {
+        CreateShareResult r = store.createShare("proj", project42, "viewer", alice, 600);
+        assertTrue(r.share().id().matches("^shr_[0-9a-f]{32}$"));
+        assertNotEquals(r.token(), r.share().id());
+        assertTrue(r.token().length() > 20);
+        assertFalse(r.share().singleUse());
+        assertNull(r.share().consumedAt());
+        assertNull(r.share().revokedAt());
+    }
+
+    @Test
+    void getShare_unknownRaises() {
+        assertThrows(ShareNotFoundError.class, () -> store.getShare(Id.generate("shr")));
+    }
+
+    @Test
+    void rejectMalformedRelation() {
+        assertThrows(InvalidFormatError.class, () ->
+                store.createShare("proj", project42, "Viewer!", alice, 600));
+    }
+
+    @Test
+    void rejectMalformedObjectType() {
+        assertThrows(InvalidFormatError.class, () ->
+                store.createShare("Project", project42, "viewer", alice, 600));
+    }
+
+    @Test
+    void rejectNegativeTtl() {
+        assertThrows(InvalidFormatError.class, () ->
+                store.createShare("proj", project42, "viewer", alice, -1));
+    }
+
+    @Test
+    void rejectTtlAboveCeiling() {
+        assertThrows(InvalidFormatError.class, () ->
+                store.createShare("proj", project42, "viewer", alice, ShareStore.MAX_TTL_SECONDS + 1));
+    }
+
+    @Test
+    void verifyShareToken_returnsShare() {
+        CreateShareResult r = store.createShare("proj", project42, "viewer", alice, 600);
+        VerifiedShare v = store.verifyShareToken(r.token());
+        assertEquals(r.share().id(), v.shareId());
+        assertEquals("proj", v.objectType());
+        assertEquals(project42, v.objectId());
+        assertEquals("viewer", v.relation());
+    }
+
+    @Test
+    void verifyJunkRaises() {
+        assertThrows(InvalidShareTokenError.class, () -> store.verifyShareToken("not-a-token"));
+    }
+
+    @Test
+    void verifyRevokedRaises() {
+        CreateShareResult r = store.createShare("proj", project42, "viewer", alice, 600);
+        store.revokeShare(r.share().id());
+        assertThrows(ShareRevokedError.class, () -> store.verifyShareToken(r.token()));
+    }
+
+    @Test
+    void verifyExpiredRaises() {
+        AtomicReference<Instant> nowRef = new AtomicReference<>(Instant.parse("2026-04-27T00:00:00Z"));
+        Clock clock = new Clock() {
+            @Override
+            public ZoneId getZone() { return ZoneId.of("UTC"); }
+            @Override
+            public Clock withZone(ZoneId zone) { return this; }
+            @Override
+            public Instant instant() { return nowRef.get(); }
+        };
+        InMemoryShareStore s = new InMemoryShareStore(clock);
+        CreateShareResult r = s.createShare("proj", project42, "viewer", alice, 60);
+        nowRef.set(nowRef.get().plus(Duration.ofSeconds(61)));
+        assertThrows(ShareExpiredError.class, () -> s.verifyShareToken(r.token()));
+    }
+
+    @Test
+    void singleUse_consumesOnFirstVerify_rejectsSubsequent() {
+        CreateShareResult r = store.createShare("proj", project42, "viewer", alice, 600, true);
+        store.verifyShareToken(r.token());
+        assertThrows(ShareConsumedError.class, () -> store.verifyShareToken(r.token()));
+    }
+
+    @Test
+    void singleUse_consumedAt_setOnRecord() {
+        CreateShareResult r = store.createShare("proj", project42, "viewer", alice, 600, true);
+        assertNull(r.share().consumedAt());
+        store.verifyShareToken(r.token());
+        Share after = store.getShare(r.share().id());
+        assertNotNull(after.consumedAt());
+    }
+
+    @Test
+    void nonSingleUse_canVerifyRepeatedly() {
+        CreateShareResult r = store.createShare("proj", project42, "viewer", alice, 600);
+        store.verifyShareToken(r.token());
+        VerifiedShare second = store.verifyShareToken(r.token());
+        assertEquals("viewer", second.relation());
+    }
+
+    @Test
+    void revokedPlusExpired_yieldsRevoked() {
+        AtomicReference<Instant> nowRef = new AtomicReference<>(Instant.parse("2026-04-27T00:00:00Z"));
+        Clock clock = new Clock() {
+            @Override
+            public ZoneId getZone() { return ZoneId.of("UTC"); }
+            @Override
+            public Clock withZone(ZoneId zone) { return this; }
+            @Override
+            public Instant instant() { return nowRef.get(); }
+        };
+        InMemoryShareStore s = new InMemoryShareStore(clock);
+        CreateShareResult r = s.createShare("proj", project42, "viewer", alice, 60);
+        s.revokeShare(r.share().id());
+        nowRef.set(nowRef.get().plus(Duration.ofSeconds(61)));
+        assertThrows(ShareRevokedError.class, () -> s.verifyShareToken(r.token()));
+    }
+
+    @Test
+    void revokeShare_idempotent() {
+        CreateShareResult r = store.createShare("proj", project42, "viewer", alice, 600);
+        Share first = store.revokeShare(r.share().id());
+        Share second = store.revokeShare(r.share().id());
+        assertEquals(first.revokedAt(), second.revokedAt());
+    }
+
+    @Test
+    void revokeUnknown_raises() {
+        assertThrows(ShareNotFoundError.class, () -> store.revokeShare(Id.generate("shr")));
+    }
+
+    @Test
+    void listSharesForObject_paginates() {
+        String other = UUID.randomUUID().toString();
+        for (String obj : new String[]{project42, project42, other, project42}) {
+            store.createShare("proj", obj, "viewer", alice, 600);
+        }
+        Page<Share> page1 = store.listSharesForObject("proj", project42, null, 2);
+        assertEquals(2, page1.data().size());
+        assertNotNull(page1.nextCursor());
+        Page<Share> page2 = store.listSharesForObject("proj", project42, page1.nextCursor(), 10);
+        Set<String> ids = new HashSet<>();
+        page1.data().forEach(s -> ids.add(s.id()));
+        page2.data().forEach(s -> ids.add(s.id()));
+        assertEquals(3, ids.size());
+    }
+}
