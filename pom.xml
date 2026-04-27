@@ -7,7 +7,7 @@
 
     <groupId>dev.flametrench</groupId>
     <artifactId>authz</artifactId>
-    <version>0.2.0-rc.1</version>
+    <version>0.2.0-rc.2</version>
     <packaging>jar</packaging>
 
     <name>flametrench-authz</name>
@@ -49,6 +49,17 @@
             <version>0.2.0-rc.1</version>
         </dependency>
 
+        <!-- Optional: only needed by PostgresTupleStore. Adopters wire
+             their own DataSource; the org.postgresql driver is the
+             reference fixture and is the standard JDBC driver for
+             vanilla Postgres targets. -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.7.4</version>
+            <optional>true</optional>
+        </dependency>
+
         <!-- Test dependencies -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
@@ -60,6 +71,12 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
             <version>${jackson.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.7.4</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
