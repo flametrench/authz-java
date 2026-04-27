@@ -199,6 +199,39 @@ class PostgresShareStoreTest {
         assertThrows(ShareNotFoundError.class, () -> store.getShare(Id.generate("shr")));
     }
 
+    // ─── ADR 0012: created_by must be an active user ───
+
+    @Test
+    void rejectsCreateWhenCreatorIsSuspended() throws Exception {
+        try (Connection conn = dataSource.getConnection();
+             var ps = conn.prepareStatement(
+                     "UPDATE usr SET status = 'suspended' WHERE id = ?")) {
+            ps.setObject(1, UUID.fromString(Id.decode(alice).uuid()));
+            ps.executeUpdate();
+        }
+        assertThrows(PreconditionError.class, () ->
+                store.createShare("proj", project42, "viewer", alice, 600));
+    }
+
+    @Test
+    void rejectsCreateWhenCreatorIsRevoked() throws Exception {
+        try (Connection conn = dataSource.getConnection();
+             var ps = conn.prepareStatement(
+                     "UPDATE usr SET status = 'revoked' WHERE id = ?")) {
+            ps.setObject(1, UUID.fromString(Id.decode(alice).uuid()));
+            ps.executeUpdate();
+        }
+        assertThrows(PreconditionError.class, () ->
+                store.createShare("proj", project42, "viewer", alice, 600));
+    }
+
+    @Test
+    void rejectsCreateWhenCreatorDoesNotExist() {
+        String ghost = Id.generate("usr");
+        assertThrows(PreconditionError.class, () ->
+                store.createShare("proj", project42, "viewer", ghost, 600));
+    }
+
     @Test
     void consumedPlusExpired_yieldsConsumed() {
         // Spec error precedence: consumed > expired.

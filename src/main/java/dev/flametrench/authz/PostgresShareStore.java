@@ -148,29 +148,55 @@ public class PostgresShareStore implements ShareStore {
             boolean singleUse
     ) {
         validate(relation, objectType, expiresInSeconds);
+        UUID createdByUuid = wireToUuid(createdBy);
         UUID shareUuid = UUID.fromString(Id.decode(Id.generate("shr")).uuid());
         String token = generateToken();
         byte[] tokenHash = hashTokenBytes(token);
         Instant now = now();
         Instant expiresAt = now.plusSeconds(expiresInSeconds);
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                     "INSERT INTO shr (id, token_hash, object_type, object_id, relation,"
-                   + " created_by, expires_at, single_use, created_at)"
-                   + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                   + " RETURNING " + SHR_COLS)) {
-            ps.setObject(1, shareUuid);
-            ps.setBytes(2, tokenHash);
-            ps.setString(3, objectType);
-            ps.setObject(4, objectIdToUuid(objectId));
-            ps.setString(5, relation);
-            ps.setObject(6, wireToUuid(createdBy));
-            ps.setTimestamp(7, Timestamp.from(expiresAt));
-            ps.setBoolean(8, singleUse);
-            ps.setTimestamp(9, Timestamp.from(now));
-            try (ResultSet rs = ps.executeQuery()) {
-                rs.next();
-                return new CreateShareResult(rowToShare(rs), token);
+        try (Connection conn = dataSource.getConnection()) {
+            // ADR 0012: created_by MUST resolve to an active user. The
+            // DDL FK enforces existence; status is checked here at the
+            // SDK layer. Suspended/revoked users with leaked credentials
+            // cannot mint shares.
+            try (PreparedStatement check = conn.prepareStatement(
+                    "SELECT status FROM usr WHERE id = ?")) {
+                check.setObject(1, createdByUuid);
+                try (ResultSet rs = check.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new PreconditionError(
+                                "created_by " + createdBy + " does not exist",
+                                "creator_not_found"
+                        );
+                    }
+                    String status = rs.getString("status");
+                    if (!"active".equals(status)) {
+                        throw new PreconditionError(
+                                "created_by " + createdBy + " is " + status
+                              + "; only active users can mint shares",
+                                "creator_not_active"
+                        );
+                    }
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO shr (id, token_hash, object_type, object_id, relation,"
+                  + " created_by, expires_at, single_use, created_at)"
+                  + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                  + " RETURNING " + SHR_COLS)) {
+                ps.setObject(1, shareUuid);
+                ps.setBytes(2, tokenHash);
+                ps.setString(3, objectType);
+                ps.setObject(4, objectIdToUuid(objectId));
+                ps.setString(5, relation);
+                ps.setObject(6, createdByUuid);
+                ps.setTimestamp(7, Timestamp.from(expiresAt));
+                ps.setBoolean(8, singleUse);
+                ps.setTimestamp(9, Timestamp.from(now));
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    return new CreateShareResult(rowToShare(rs), token);
+                }
             }
         } catch (SQLException e) {
             throw new RuntimeException(e);
