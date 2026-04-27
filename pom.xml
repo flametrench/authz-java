@@ -27,6 +27,15 @@
         <url>https://flametrench.dev</url>
     </organization>
 
+    <developers>
+        <developer>
+            <name>Nathan Call</name>
+            <email>nate@site-source.com</email>
+            <organization>NDC Digital, LLC</organization>
+            <organizationUrl>https://flametrench.dev</organizationUrl>
+        </developer>
+    </developers>
+
     <scm>
         <url>https://github.com/flametrench/authz-java</url>
         <connection>scm:git:https://github.com/flametrench/authz-java.git</connection>
@@ -95,4 +104,78 @@
             </plugin>
         </plugins>
     </build>
+
+    <!-- Maven Central publishing: activate with the "release" profile.
+         See RUNBOOK-MAVEN-CENTRAL.md for one-time setup (GPG key, Sonatype
+         Central Portal user token, settings.xml). Publish: mvn clean deploy -P release. -->
+    <profiles>
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>3.3.1</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>3.11.2</version>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.2.7</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                                <configuration>
+                                    <gpgArguments>
+                                        <arg>--pinentry-mode</arg>
+                                        <arg>loopback</arg>
+                                    </gpgArguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.7.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <!-- autoPublish=false: bundle uploads + validates,
+                                 then waits in PENDING for explicit release.
+                                 Flip to true once we're confident in the
+                                 publish flow. -->
+                            <autoPublish>false</autoPublish>
+                            <waitUntil>validated</waitUntil>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
