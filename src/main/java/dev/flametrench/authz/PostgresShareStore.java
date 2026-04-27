@@ -126,7 +126,19 @@ public class PostgresShareStore implements ShareStore {
         }
     }
 
+    private static final java.util.regex.Pattern OBJECT_ID_WIRE =
+            java.util.regex.Pattern.compile("^[a-z]{2,6}_[0-9a-f]{32}$");
+
+    /**
+     * Decode an {@code object_id} to a Postgres-bindable UUID. See
+     * {@code PostgresTupleStore#objectIdToUuid} for rationale (spec#8) —
+     * wire-format prefixed IDs with non-registered prefixes (e.g.
+     * {@code proj_<hex>}) are decoded via {@link Id#decodeAny(String)}.
+     */
     private static UUID objectIdToUuid(String objectId) {
+        if (OBJECT_ID_WIRE.matcher(objectId).matches()) {
+            return UUID.fromString(Id.decodeAny(objectId).uuid());
+        }
         if (objectId.length() == 32) {
             String s = objectId;
             return UUID.fromString(

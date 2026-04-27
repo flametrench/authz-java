@@ -66,15 +66,23 @@ public class PostgresTupleStore implements TupleStore {
         return Id.decode(wireId).uuid();
     }
 
+    private static final java.util.regex.Pattern OBJECT_ID_WIRE =
+            java.util.regex.Pattern.compile("^[a-z]{2,6}_[0-9a-f]{32}$");
+
     /**
-     * The {@code tup.object_id} column is typed UUID in the spec
-     * schema. Adopters' application object types use bare-UUID
-     * identifiers (e.g. {@code "0190..."}) at the SDK boundary; the
-     * Postgres JDBC driver doesn't auto-cast strings to UUID, so
-     * convert at the boundary.
+     * Decode an {@code object_id} to a Postgres-bindable UUID. Accepts:
+     * <ol>
+     *   <li>Wire-format prefixed IDs ({@code <prefix>_<32hex>}) — including
+     *       app-defined prefixes that aren't in {@link Id#TYPES}, decoded
+     *       via {@link Id#decodeAny(String)}. Closes spec#8.</li>
+     *   <li>Raw 32-char hex UUIDs — formatted to canonical form.</li>
+     *   <li>Canonical hyphenated UUIDs — passed through.</li>
+     * </ol>
      */
     private static UUID objectIdToUuid(String objectId) {
-        // Accept both hyphenated ("0190f2a8-...") and 32-char hex forms.
+        if (OBJECT_ID_WIRE.matcher(objectId).matches()) {
+            return UUID.fromString(Id.decodeAny(objectId).uuid());
+        }
         if (objectId.length() == 32) {
             String s = objectId;
             String formatted = s.substring(0, 8) + "-" + s.substring(8, 12)

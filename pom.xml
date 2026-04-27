@@ -7,7 +7,7 @@
 
     <groupId>dev.flametrench</groupId>
     <artifactId>authz</artifactId>
-    <version>0.2.0-rc.3</version>
+    <version>0.2.0-rc.4</version>
     <packaging>jar</packaging>
 
     <name>flametrench-authz</name>

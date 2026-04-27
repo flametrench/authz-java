@@ -232,4 +232,24 @@ class PostgresTupleStoreTest {
         page2.data().forEach(t -> all.add(t.id()));
         assertEquals(5, all.size());
     }
+
+    /**
+     * spec#8 regression: object_type is application-defined per ADR
+     * 0001, so adopters legitimately pass wire-format prefixed IDs
+     * (e.g. {@code proj_<32hex>}, {@code file_<32hex>}) at this
+     * boundary. Previously, {@code UUID.fromString} threw on the
+     * prefixed form when binding to the UUID column.
+     */
+    @Test
+    void wireFormatObjectIdWithAppDefinedPrefix_isAccepted() {
+        String wireProj = "proj_" + newObjectId().replace("-", "");
+        Tuple t = store.createTuple("usr", alice, "owner", "proj", wireProj);
+        assertTrue(t.id().matches("^tup_[0-9a-f]{32}$"));
+        // check() and listTuplesByObject() must accept the same wire-
+        // format value back through the read paths.
+        CheckResult result = store.check("usr", alice, "owner", "proj", wireProj);
+        assertTrue(result.allowed());
+        Page<Tuple> listed = store.listTuplesByObject("proj", wireProj, null, null, 50);
+        assertEquals(1, listed.data().size());
+    }
 }
