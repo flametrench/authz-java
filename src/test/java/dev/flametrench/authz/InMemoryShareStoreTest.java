@@ -186,4 +186,44 @@ class InMemoryShareStoreTest {
         page2.data().forEach(s -> ids.add(s.id()));
         assertEquals(3, ids.size());
     }
+
+    @Test
+    void consumedPlusExpired_yieldsConsumed() {
+        // Spec error precedence: consumed > expired.
+        AtomicReference<Instant> nowRef = new AtomicReference<>(Instant.parse("2026-04-27T00:00:00Z"));
+        Clock clock = new Clock() {
+            @Override public ZoneId getZone() { return ZoneId.of("UTC"); }
+            @Override public Clock withZone(ZoneId zone) { return this; }
+            @Override public Instant instant() { return nowRef.get(); }
+        };
+        InMemoryShareStore s = new InMemoryShareStore(clock);
+        CreateShareResult r = s.createShare("proj", project42, "viewer", alice, 60, true);
+        s.verifyShareToken(r.token()); // consumes
+        nowRef.set(nowRef.get().plus(Duration.ofSeconds(61))); // now also expired
+        assertThrows(ShareConsumedError.class, () -> s.verifyShareToken(r.token()));
+    }
+
+    @Test
+    void createdBy_roundTrips() {
+        CreateShareResult r = store.createShare("proj", project42, "viewer", alice, 600);
+        Share fetched = store.getShare(r.share().id());
+        assertEquals(alice, fetched.createdBy());
+        assertTrue(fetched.createdBy().startsWith("usr_"));
+    }
+
+    @Test
+    void list_includesRevokedAndConsumed() {
+        CreateShareResult active = store.createShare("proj", project42, "viewer", alice, 600);
+        CreateShareResult revoked = store.createShare("proj", project42, "viewer", alice, 600);
+        CreateShareResult consumed = store.createShare("proj", project42, "viewer", alice, 600, true);
+        store.revokeShare(revoked.share().id());
+        store.verifyShareToken(consumed.token());
+        Page<Share> page = store.listSharesForObject("proj", project42, null, 50);
+        Set<String> ids = new HashSet<>();
+        page.data().forEach(s -> ids.add(s.id()));
+        assertTrue(ids.contains(active.share().id()));
+        assertTrue(ids.contains(revoked.share().id()));
+        assertTrue(ids.contains(consumed.share().id()));
+        assertEquals(3, ids.size());
+    }
 }
