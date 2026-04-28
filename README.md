@@ -1,5 +1,7 @@
 # flametrench-authz (Java)
 
+[![CI](https://github.com/flametrench/authz-java/actions/workflows/ci.yml/badge.svg)](https://github.com/flametrench/authz-java/actions/workflows/ci.yml)
+
 Java SDK for the [Flametrench](https://github.com/flametrench/spec) authorization specification: relational tuples and exact-match `check()`. Exact-match is the default — no implicit rewriting at the API boundary ([ADR 0001](https://github.com/flametrench/spec/blob/main/decisions/0001-authorization-model.md)). v0.2 adds opt-in rewrite rules ([ADR 0007](https://github.com/flametrench/spec/blob/main/decisions/0007-rewrite-rules.md)) — `computed_userset` (role implication) and `tuple_to_userset` (parent-child inheritance) — for adopters who want hierarchies. Group expansion remains deferred.
 
 The same fixture corpus that gates `@flametrench/authz` (Node), `flametrench/authz` (PHP), and `flametrench-authz` (Python) runs here.
