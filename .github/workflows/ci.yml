@@ -32,14 +32,20 @@ jobs:
           --health-retries 5
 
     env:
-      # Enables PostgresTupleStore + PostgresShareStore integration tests.
-      # Test fixtures apply the schema themselves on each run; unset →
-      # those tests skip gracefully.
       AUTHZ_POSTGRES_URL: postgresql://postgres:test@localhost:5432/flametrench_test
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Checkout flametrench/ids-java
+        # Bootstrap the upstream `ids` dep at the version the pom pins
+        # (0.2.0-rc.2) until v0.2.x is published to Maven Central.
+        uses: actions/checkout@v4
+        with:
+          repository: flametrench/ids-java
+          ref: v0.2.0-rc.2
+          path: _vendored/ids-java
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -47,6 +53,9 @@ jobs:
           distribution: 'temurin'
           java-version: ${{ matrix.java }}
           cache: 'maven'
+
+      - name: Install ids dep to local Maven repo
+        run: mvn -B -f _vendored/ids-java/pom.xml install -DskipTests
 
       - name: Run tests
         run: mvn -B test
