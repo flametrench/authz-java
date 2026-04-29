@@ -252,4 +252,47 @@ class PostgresTupleStoreTest {
         Page<Tuple> listed = store.listTuplesByObject("proj", wireProj, null, null, 50);
         assertEquals(1, listed.data().size());
     }
+
+    // ─── Outer-transaction nesting (ADR 0013) ───
+
+    @Test
+    void createTuple_cooperatesWithOuterTransaction() throws java.sql.SQLException {
+        String project = newObjectId();
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresTupleStore nested = new PostgresTupleStore(conn);
+            nested.createTuple("usr", alice, "viewer", "proj", project);
+            conn.commit();
+            CheckResult r = store.check("usr", alice, "viewer", "proj", project);
+            assertTrue(r.allowed());
+        }
+    }
+
+    @Test
+    void outerRollback_undoesInnerCreateTuple() throws java.sql.SQLException {
+        String project = newObjectId();
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresTupleStore nested = new PostgresTupleStore(conn);
+            nested.createTuple("usr", alice, "viewer", "proj", project);
+            conn.rollback();
+        }
+        CheckResult r = store.check("usr", alice, "viewer", "proj", project);
+        assertFalse(r.allowed());
+    }
+
+    @Test
+    void multipleCallsCommitOrRollbackTogether() throws java.sql.SQLException {
+        String projA = newObjectId();
+        String projB = newObjectId();
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresTupleStore nested = new PostgresTupleStore(conn);
+            nested.createTuple("usr", alice, "viewer", "proj", projA);
+            nested.createTuple("usr", bob, "viewer", "proj", projB);
+            conn.rollback();
+        }
+        assertFalse(store.check("usr", alice, "viewer", "proj", projA).allowed());
+        assertFalse(store.check("usr", bob, "viewer", "proj", projB).allowed());
+    }
 }

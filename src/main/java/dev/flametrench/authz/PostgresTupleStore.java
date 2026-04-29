@@ -6,6 +6,8 @@ package dev.flametrench.authz;
 import dev.flametrench.ids.Id;
 
 import javax.sql.DataSource;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.sql.Array;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -51,6 +53,7 @@ public class PostgresTupleStore implements TupleStore {
             "id, subject_type, subject_id, relation, object_type, object_id, created_at, created_by";
 
     private final DataSource dataSource;
+    private final Connection callerConnection;
     private final Clock clock;
 
     public PostgresTupleStore(DataSource dataSource) {
@@ -59,7 +62,41 @@ public class PostgresTupleStore implements TupleStore {
 
     public PostgresTupleStore(DataSource dataSource, Clock clock) {
         this.dataSource = dataSource;
+        this.callerConnection = null;
         this.clock = clock;
+    }
+
+    /**
+     * ADR 0013 caller-owned-connection constructor. The adopter manages
+     * the Connection's transaction lifecycle; this store routes its
+     * queries to that connection (no close on end-of-try).
+     */
+    public PostgresTupleStore(Connection callerConnection) {
+        this(callerConnection, Clock.systemUTC());
+    }
+
+    public PostgresTupleStore(Connection callerConnection, Clock clock) {
+        this.dataSource = null;
+        this.callerConnection = callerConnection;
+        this.clock = clock;
+    }
+
+    private Connection acquireConnection() throws SQLException {
+        if (callerConnection == null) return dataSource.getConnection();
+        return (Connection) Proxy.newProxyInstance(
+            Connection.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> {
+                if ("close".equals(method.getName()) && method.getParameterCount() == 0) {
+                    return null;
+                }
+                try {
+                    return method.invoke(callerConnection, args);
+                } catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            }
+        );
     }
 
     private static String wireToUuid(String wireId) {
@@ -148,10 +185,15 @@ public class PostgresTupleStore implements TupleStore {
         UUID subjectUuid = UUID.fromString(wireToUuid(subjectId));
         UUID createdByUuid = createdBy != null ? UUID.fromString(wireToUuid(createdBy)) : null;
         Instant now = now();
-        try (Connection conn = dataSource.getConnection()) {
+        // ADR 0013: ON CONFLICT DO NOTHING avoids raising 23505 inside
+        // an outer transaction (the previous catch-and-SELECT pattern
+        // would run the SELECT inside a Postgres-aborted transaction).
+        try (Connection conn = acquireConnection()) {
             try (PreparedStatement ps = conn.prepareStatement(
                     "INSERT INTO tup (id, subject_type, subject_id, relation, object_type, object_id, created_at, created_by)"
-                  + " VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING " + TUP_COLS)) {
+                  + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                  + " ON CONFLICT (subject_type, subject_id, relation, object_type, object_id) DO NOTHING"
+                  + " RETURNING " + TUP_COLS)) {
                 ps.setObject(1, tupUuid);
                 ps.setString(2, subjectType);
                 ps.setObject(3, subjectUuid);
@@ -161,45 +203,32 @@ public class PostgresTupleStore implements TupleStore {
                 ps.setTimestamp(7, Timestamp.from(now));
                 ps.setObject(8, createdByUuid);
                 try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) {
-                        throw new SQLException("INSERT returned no row");
+                    if (rs.next()) {
+                        return rowToTuple(rs);
                     }
-                    return rowToTuple(rs);
                 }
             }
-        } catch (SQLException e) {
-            if (isUniqueViolation(e)) {
-                String existing = lookupExistingTupleId(subjectType, subjectUuid, relation, objectType, objectId);
-                if (existing != null) {
-                    throw new DuplicateTupleError(
-                            "Tuple with identical natural key already exists",
-                            Id.encode("tup", existing)
-                    );
+            // Conflict: SELECT the existing row and raise.
+            try (PreparedStatement sel = conn.prepareStatement(
+                    "SELECT id FROM tup WHERE subject_type = ? AND subject_id = ? AND relation = ?"
+                  + " AND object_type = ? AND object_id = ?")) {
+                sel.setString(1, subjectType);
+                sel.setObject(2, subjectUuid);
+                sel.setString(3, relation);
+                sel.setString(4, objectType);
+                sel.setObject(5, objectIdToUuid(objectId));
+                try (ResultSet rs = sel.executeQuery()) {
+                    if (rs.next()) {
+                        throw new DuplicateTupleError(
+                                "Tuple with identical natural key already exists",
+                                Id.encode("tup", rs.getString("id"))
+                        );
+                    }
                 }
             }
-            throw new RuntimeException(e);
-        }
-    }
-
-    private String lookupExistingTupleId(
-            String subjectType,
-            UUID subjectUuid,
-            String relation,
-            String objectType,
-            String objectId
-    ) {
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                     "SELECT id FROM tup WHERE subject_type = ? AND subject_id = ? AND relation = ?"
-                   + " AND object_type = ? AND object_id = ?")) {
-            ps.setString(1, subjectType);
-            ps.setObject(2, subjectUuid);
-            ps.setString(3, relation);
-            ps.setString(4, objectType);
-            ps.setObject(5, objectIdToUuid(objectId));
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getString("id") : null;
-            }
+            // Race: another connection inserted-then-deleted between our
+            // ON CONFLICT and SELECT. Surface a generic error so callers can retry.
+            throw new SQLException("Tuple natural-key conflict resolved after insert lost the row; retry.");
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
@@ -208,7 +237,7 @@ public class PostgresTupleStore implements TupleStore {
     @Override
     public void deleteTuple(String tupleId) {
         UUID uuid = UUID.fromString(wireToUuid(tupleId));
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement("DELETE FROM tup WHERE id = ?")) {
             ps.setObject(1, uuid);
             int affected = ps.executeUpdate();
@@ -223,7 +252,7 @@ public class PostgresTupleStore implements TupleStore {
     @Override
     public int cascadeRevokeSubject(String subjectType, String subjectId) {
         UUID subjectUuid = UUID.fromString(wireToUuid(subjectId));
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "DELETE FROM tup WHERE subject_type = ? AND subject_id = ?")) {
             ps.setString(1, subjectType);
@@ -259,7 +288,7 @@ public class PostgresTupleStore implements TupleStore {
             throw new EmptyRelationSetError();
         }
         UUID subjectUuid = UUID.fromString(wireToUuid(subjectId));
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT id FROM tup WHERE subject_type = ? AND subject_id = ?"
                    + " AND relation = ANY(?) AND object_type = ? AND object_id = ? LIMIT 1")) {
@@ -285,7 +314,7 @@ public class PostgresTupleStore implements TupleStore {
     @Override
     public Tuple getTuple(String tupleId) {
         UUID uuid = UUID.fromString(wireToUuid(tupleId));
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT " + TUP_COLS + " FROM tup WHERE id = ?")) {
             ps.setObject(1, uuid);
@@ -315,7 +344,7 @@ public class PostgresTupleStore implements TupleStore {
             sql.append(" AND id > ?");
         }
         sql.append(" ORDER BY id LIMIT ?");
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             int idx = 1;
             ps.setString(idx++, subjectType);
@@ -347,7 +376,7 @@ public class PostgresTupleStore implements TupleStore {
         if (relation != null) sql.append(" AND relation = ?");
         if (cursor != null) sql.append(" AND id > ?");
         sql.append(" ORDER BY id LIMIT ?");
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             int idx = 1;
             ps.setString(idx++, objectType);

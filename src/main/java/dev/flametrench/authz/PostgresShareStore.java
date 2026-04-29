@@ -6,6 +6,8 @@ package dev.flametrench.authz;
 import dev.flametrench.ids.Id;
 
 import javax.sql.DataSource;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -40,6 +42,7 @@ public class PostgresShareStore implements ShareStore {
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     private final DataSource dataSource;
+    private final Connection callerConnection;
     private final Clock clock;
 
     public PostgresShareStore(DataSource dataSource) {
@@ -48,7 +51,37 @@ public class PostgresShareStore implements ShareStore {
 
     public PostgresShareStore(DataSource dataSource, Clock clock) {
         this.dataSource = dataSource;
+        this.callerConnection = null;
         this.clock = clock;
+    }
+
+    /** ADR 0013 caller-owned-connection constructor. */
+    public PostgresShareStore(Connection callerConnection) {
+        this(callerConnection, Clock.systemUTC());
+    }
+
+    public PostgresShareStore(Connection callerConnection, Clock clock) {
+        this.dataSource = null;
+        this.callerConnection = callerConnection;
+        this.clock = clock;
+    }
+
+    private Connection acquireConnection() throws SQLException {
+        if (callerConnection == null) return dataSource.getConnection();
+        return (Connection) Proxy.newProxyInstance(
+            Connection.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> {
+                if ("close".equals(method.getName()) && method.getParameterCount() == 0) {
+                    return null;
+                }
+                try {
+                    return method.invoke(callerConnection, args);
+                } catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            }
+        );
     }
 
     private Instant now() {
@@ -166,7 +199,7 @@ public class PostgresShareStore implements ShareStore {
         byte[] tokenHash = hashTokenBytes(token);
         Instant now = now();
         Instant expiresAt = now.plusSeconds(expiresInSeconds);
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             // ADR 0012: created_by MUST resolve to an active user. The
             // DDL FK enforces existence; status is checked here at the
             // SDK layer. Suspended/revoked users with leaked credentials
@@ -217,7 +250,7 @@ public class PostgresShareStore implements ShareStore {
 
     @Override
     public Share getShare(String shareId) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT " + SHR_COLS + " FROM shr WHERE id = ?")) {
             ps.setObject(1, wireToUuid(shareId));
@@ -235,7 +268,7 @@ public class PostgresShareStore implements ShareStore {
     @Override
     public VerifiedShare verifyShareToken(String token) {
         byte[] inputHash = hashTokenBytes(token);
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             boolean prevAuto = conn.getAutoCommit();
             conn.setAutoCommit(false);
             try {
@@ -312,7 +345,7 @@ public class PostgresShareStore implements ShareStore {
 
     @Override
     public Share revokeShare(String shareId) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "UPDATE shr SET revoked_at = COALESCE(revoked_at, ?)"
                    + " WHERE id = ?"
@@ -343,7 +376,7 @@ public class PostgresShareStore implements ShareStore {
         );
         if (cursor != null) sql.append(" AND id > ?");
         sql.append(" ORDER BY id LIMIT ?");
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             int idx = 1;
             ps.setString(idx++, objectType);
