@@ -6,7 +6,7 @@ Java SDK for the [Flametrench](https://github.com/flametrench/spec) authorizatio
 
 The same fixture corpus that gates `@flametrench/authz` (Node), `flametrench/authz` (PHP), and `flametrench-authz` (Python) runs here.
 
-**Status:** v0.2.0-rc.5 (release candidate). Includes `ShareStore` ([ADR 0012](https://github.com/flametrench/spec/blob/main/decisions/0012-share-tokens.md)) and Postgres-backed adapters (`PostgresTupleStore`, `PostgresShareStore`).
+**Status:** v0.2.0-rc.6 (release candidate). Includes `ShareStore` ([ADR 0012](https://github.com/flametrench/spec/blob/main/decisions/0012-share-tokens.md)) and Postgres-backed adapters (`PostgresTupleStore`, `PostgresShareStore`).
 
 ```java
 import dev.flametrench.authz.InMemoryTupleStore;
@@ -31,7 +31,7 @@ Maven:
 <dependency>
     <groupId>dev.flametrench</groupId>
     <artifactId>authz</artifactId>
-    <version>0.2.0-rc.5</version>
+    <version>0.2.0-rc.6</version>
 </dependency>
 ```
 

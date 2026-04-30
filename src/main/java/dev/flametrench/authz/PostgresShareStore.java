@@ -15,6 +15,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Savepoint;
 import java.sql.Timestamp;
 import java.sql.Types;
 import java.time.Clock;
@@ -86,6 +87,102 @@ public class PostgresShareStore implements ShareStore {
 
     private Instant now() {
         return clock.instant();
+    }
+
+    private boolean isCallerOwned() {
+        return callerConnection != null;
+    }
+
+    private static String makeSavepointName() {
+        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+        String method = stack.length > 3 ? stack[3].getMethodName() : "tx";
+        String safe = method.replaceAll("[^A-Za-z0-9_]", "");
+        if (safe.isEmpty()) safe = "tx";
+        byte[] r = new byte[4];
+        SECURE_RANDOM.nextBytes(r);
+        StringBuilder hex = new StringBuilder(8);
+        for (byte b : r) hex.append(String.format("%02x", b & 0xff));
+        return "ft_" + safe + "_" + hex;
+    }
+
+    @FunctionalInterface
+    private interface TxFn<T> {
+        T apply(Connection conn) throws SQLException;
+    }
+
+    /** ADR 0013 — multi-statement helper. SAVEPOINT when nested, BEGIN/COMMIT standalone. */
+    private <T> T tx(TxFn<T> fn) {
+        if (isCallerOwned()) {
+            Connection conn = callerConnection;
+            try {
+                Savepoint sp = conn.setSavepoint(makeSavepointName());
+                try {
+                    T result = fn.apply(conn);
+                    conn.releaseSavepoint(sp);
+                    return result;
+                } catch (SQLException | RuntimeException e) {
+                    try {
+                        conn.rollback(sp);
+                        conn.releaseSavepoint(sp);
+                    } catch (SQLException ignored) {
+                    }
+                    if (e instanceof SQLException) throw new RuntimeException(e);
+                    throw (RuntimeException) e;
+                }
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        try (Connection conn = acquireConnection()) {
+            boolean prevAuto = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                T result = fn.apply(conn);
+                conn.commit();
+                return result;
+            } catch (SQLException | RuntimeException e) {
+                try {
+                    conn.rollback();
+                } catch (SQLException ignored) {
+                }
+                if (e instanceof SQLException) throw new RuntimeException(e);
+                throw (RuntimeException) e;
+            } finally {
+                conn.setAutoCommit(prevAuto);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /** ADR 0013 — single-statement shielding. SAVEPOINT when nested, passthrough standalone. */
+    private <T> T nested(TxFn<T> fn) {
+        if (!isCallerOwned()) {
+            try (Connection conn = acquireConnection()) {
+                return fn.apply(conn);
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        Connection conn = callerConnection;
+        try {
+            Savepoint sp = conn.setSavepoint(makeSavepointName());
+            try {
+                T result = fn.apply(conn);
+                conn.releaseSavepoint(sp);
+                return result;
+            } catch (SQLException | RuntimeException e) {
+                try {
+                    conn.rollback(sp);
+                    conn.releaseSavepoint(sp);
+                } catch (SQLException ignored) {
+                }
+                if (e instanceof SQLException) throw new RuntimeException(e);
+                throw (RuntimeException) e;
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private static UUID wireToUuid(String wireId) {
@@ -199,7 +296,7 @@ public class PostgresShareStore implements ShareStore {
         byte[] tokenHash = hashTokenBytes(token);
         Instant now = now();
         Instant expiresAt = now.plusSeconds(expiresInSeconds);
-        try (Connection conn = acquireConnection()) {
+        return nested(conn -> {
             // ADR 0012: created_by MUST resolve to an active user. The
             // DDL FK enforces existence; status is checked here at the
             // SDK layer. Suspended/revoked users with leaked credentials
@@ -243,9 +340,7 @@ public class PostgresShareStore implements ShareStore {
                     return new CreateShareResult(rowToShare(rs), token);
                 }
             }
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
-        }
+        });
     }
 
     @Override
@@ -268,99 +363,82 @@ public class PostgresShareStore implements ShareStore {
     @Override
     public VerifiedShare verifyShareToken(String token) {
         byte[] inputHash = hashTokenBytes(token);
-        try (Connection conn = acquireConnection()) {
-            boolean prevAuto = conn.getAutoCommit();
-            conn.setAutoCommit(false);
-            try {
-                String rowId;
-                byte[] storedHash;
-                Instant expiresAt;
-                Timestamp consumedAt;
-                Timestamp revokedAt;
-                boolean singleUse;
-                String objectType;
-                String objectId;
-                String relation;
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT " + SHR_COLS + " FROM shr"
-                      + " WHERE token_hash = ?"
-                      + " ORDER BY created_at DESC LIMIT 1"
-                      + " FOR UPDATE")) {
-                    ps.setBytes(1, inputHash);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        if (!rs.next()) throw new InvalidShareTokenError();
-                        rowId = rs.getString("id");
-                        storedHash = rs.getBytes("token_hash");
-                        expiresAt = rs.getTimestamp("expires_at").toInstant();
-                        consumedAt = rs.getTimestamp("consumed_at");
-                        revokedAt = rs.getTimestamp("revoked_at");
-                        singleUse = rs.getBoolean("single_use");
-                        objectType = rs.getString("object_type");
-                        objectId = rs.getString("object_id");
-                        relation = rs.getString("relation");
-                    }
+        return tx(conn -> {
+            String rowId;
+            byte[] storedHash;
+            Instant expiresAt;
+            Timestamp consumedAt;
+            Timestamp revokedAt;
+            boolean singleUse;
+            String objectType;
+            String objectId;
+            String relation;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT " + SHR_COLS + " FROM shr"
+                  + " WHERE token_hash = ?"
+                  + " ORDER BY created_at DESC LIMIT 1"
+                  + " FOR UPDATE")) {
+                ps.setBytes(1, inputHash);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) throw new InvalidShareTokenError();
+                    rowId = rs.getString("id");
+                    storedHash = rs.getBytes("token_hash");
+                    expiresAt = rs.getTimestamp("expires_at").toInstant();
+                    consumedAt = rs.getTimestamp("consumed_at");
+                    revokedAt = rs.getTimestamp("revoked_at");
+                    singleUse = rs.getBoolean("single_use");
+                    objectType = rs.getString("object_type");
+                    objectId = rs.getString("object_id");
+                    relation = rs.getString("relation");
                 }
-                // Defense-in-depth: constant-time compare on the BYTEA column.
-                if (!constantTimeEquals(inputHash, storedHash)) {
-                    throw new InvalidShareTokenError();
-                }
-                // Spec error precedence: revoked > consumed > expired.
-                if (revokedAt != null) throw new ShareRevokedError();
-                if (singleUse && consumedAt != null) throw new ShareConsumedError();
-                Instant now = now();
-                if (!now.isBefore(expiresAt)) throw new ShareExpiredError();
-                if (singleUse) {
-                    // Atomic consume — concurrent verifies race here. The
-                    // WHERE consumed_at IS NULL is what makes the second loser.
-                    try (PreparedStatement upd = conn.prepareStatement(
-                            "UPDATE shr SET consumed_at = ?"
-                          + " WHERE id = ? AND consumed_at IS NULL"
-                          + " RETURNING id")) {
-                        upd.setTimestamp(1, Timestamp.from(now));
-                        upd.setObject(2, UUID.fromString(rowId));
-                        try (ResultSet urs = upd.executeQuery()) {
-                            if (!urs.next()) throw new ShareConsumedError();
-                        }
-                    }
-                }
-                conn.commit();
-                return new VerifiedShare(
-                        Id.encode("shr", rowId),
-                        objectType, objectId, relation
-                );
-            } catch (RuntimeException | SQLException e) {
-                try {
-                    conn.rollback();
-                } catch (SQLException ignored) {
-                }
-                if (e instanceof SQLException) throw new RuntimeException(e);
-                throw (RuntimeException) e;
-            } finally {
-                conn.setAutoCommit(prevAuto);
             }
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
-        }
+            // Defense-in-depth: constant-time compare on the BYTEA column.
+            if (!constantTimeEquals(inputHash, storedHash)) {
+                throw new InvalidShareTokenError();
+            }
+            // Spec error precedence: revoked > consumed > expired.
+            if (revokedAt != null) throw new ShareRevokedError();
+            if (singleUse && consumedAt != null) throw new ShareConsumedError();
+            Instant now = now();
+            if (!now.isBefore(expiresAt)) throw new ShareExpiredError();
+            if (singleUse) {
+                // Atomic consume — concurrent verifies race here. The
+                // WHERE consumed_at IS NULL is what makes the second loser.
+                try (PreparedStatement upd = conn.prepareStatement(
+                        "UPDATE shr SET consumed_at = ?"
+                      + " WHERE id = ? AND consumed_at IS NULL"
+                      + " RETURNING id")) {
+                    upd.setTimestamp(1, Timestamp.from(now));
+                    upd.setObject(2, UUID.fromString(rowId));
+                    try (ResultSet urs = upd.executeQuery()) {
+                        if (!urs.next()) throw new ShareConsumedError();
+                    }
+                }
+            }
+            return new VerifiedShare(
+                    Id.encode("shr", rowId),
+                    objectType, objectId, relation
+            );
+        });
     }
 
     @Override
     public Share revokeShare(String shareId) {
-        try (Connection conn = acquireConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                     "UPDATE shr SET revoked_at = COALESCE(revoked_at, ?)"
-                   + " WHERE id = ?"
-                   + " RETURNING " + SHR_COLS)) {
-            ps.setTimestamp(1, Timestamp.from(now()));
-            ps.setObject(2, wireToUuid(shareId));
-            try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) {
-                    throw new ShareNotFoundError("Share " + shareId + " not found");
+        return nested(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE shr SET revoked_at = COALESCE(revoked_at, ?)"
+                  + " WHERE id = ?"
+                  + " RETURNING " + SHR_COLS)) {
+                ps.setTimestamp(1, Timestamp.from(now()));
+                ps.setObject(2, wireToUuid(shareId));
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new ShareNotFoundError("Share " + shareId + " not found");
+                    }
+                    return rowToShare(rs);
                 }
-                return rowToShare(rs);
             }
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
-        }
+        });
     }
 
     @Override
