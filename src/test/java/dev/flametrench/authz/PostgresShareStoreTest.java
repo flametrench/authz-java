@@ -286,4 +286,101 @@ class PostgresShareStoreTest {
         page2.data().forEach(s -> ids.add(s.id()));
         assertEquals(3, ids.size());
     }
+
+    // ─── ADR 0013: savepoint shielding for nested() single-statement writes ───
+    //
+    // createShare and revokeShare are wrapped in nested() — the SAVEPOINT must
+    // pass through into a caller-owned outer transaction without poisoning it
+    // when the inner call throws.
+
+    @Test
+    void createShare_cooperatesWithOuterTransaction() throws java.sql.SQLException {
+        String shareId;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresShareStore nested = new PostgresShareStore(conn);
+            CreateShareResult r = nested.createShare("proj", project42, "viewer", alice, 600);
+            shareId = r.share().id();
+            conn.commit();
+        }
+        assertEquals("viewer", store.getShare(shareId).relation());
+    }
+
+    @Test
+    void outerRollback_undoesInnerCreateShare() throws java.sql.SQLException {
+        String shareId;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresShareStore nested = new PostgresShareStore(conn);
+            CreateShareResult r = nested.createShare("proj", project42, "viewer", alice, 600);
+            shareId = r.share().id();
+            conn.rollback();
+        }
+        assertThrows(ShareNotFoundError.class, () -> store.getShare(shareId));
+    }
+
+    @Test
+    void createShare_savepointRollsBackOnPrecondition_outerStillUsable() throws Exception {
+        // Suspend a user — createShare's pre-check inside nested() will throw
+        // PreconditionError. Without savepoint shielding the outer txn would
+        // be left in an aborted state on any path that touched the DB first.
+        String suspended = registerUser();
+        try (Connection conn = dataSource.getConnection();
+             var ps = conn.prepareStatement(
+                     "UPDATE usr SET status = 'suspended' WHERE id = ?")) {
+            ps.setObject(1, UUID.fromString(Id.decode(suspended).uuid()));
+            ps.executeUpdate();
+        }
+
+        String survivorId;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresShareStore nested = new PostgresShareStore(conn);
+
+            assertThrows(PreconditionError.class, () ->
+                    nested.createShare("proj", project42, "viewer", suspended, 600));
+
+            // Outer still live — second SDK call commits cleanly.
+            CreateShareResult survivor = nested.createShare(
+                    "proj", project42, "viewer", alice, 600);
+            survivorId = survivor.share().id();
+            conn.commit();
+        }
+        assertEquals("viewer", store.getShare(survivorId).relation());
+    }
+
+    @Test
+    void revokeShare_savepointRollsBackOnNotFound_outerStillUsable() throws java.sql.SQLException {
+        CreateShareResult seed = store.createShare("proj", project42, "viewer", alice, 600);
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresShareStore nested = new PostgresShareStore(conn);
+
+            assertThrows(ShareNotFoundError.class, () ->
+                    nested.revokeShare(Id.generate("shr")));
+
+            // Savepoint rolled back — outer can still revoke a real share.
+            Share revoked = nested.revokeShare(seed.share().id());
+            assertNotNull(revoked.revokedAt());
+            conn.commit();
+        }
+        assertNotNull(store.getShare(seed.share().id()).revokedAt());
+    }
+
+    @Test
+    void multipleSharesInOuterTransactionCommitTogether() throws java.sql.SQLException {
+        String aId, bId;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresShareStore nested = new PostgresShareStore(conn);
+            CreateShareResult a = nested.createShare("proj", project42, "viewer", alice, 600);
+            CreateShareResult b = nested.createShare("proj", project42, "editor", alice, 600);
+            aId = a.share().id();
+            bId = b.share().id();
+            conn.rollback();
+        }
+        assertThrows(ShareNotFoundError.class, () -> store.getShare(aId));
+        assertThrows(ShareNotFoundError.class, () -> store.getShare(bId));
+    }
 }

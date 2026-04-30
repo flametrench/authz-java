@@ -7,7 +7,7 @@
 
     <groupId>dev.flametrench</groupId>
     <artifactId>authz</artifactId>
-    <version>0.2.0-rc.6</version>
+    <version>0.2.0</version>
     <packaging>jar</packaging>
 
     <name>flametrench-authz</name>
@@ -55,7 +55,7 @@
         <dependency>
             <groupId>dev.flametrench</groupId>
             <artifactId>ids</artifactId>
-            <version>0.2.0-rc.2</version>
+            <version>0.2.0</version>
         </dependency>
 
         <!-- Optional: only needed by PostgresTupleStore. Adopters wire
