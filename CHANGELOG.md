@@ -3,6 +3,11 @@
 All notable changes to `dev.flametrench:authz` are recorded here.
 Spec-level changes live in [`spec/CHANGELOG.md`](https://github.com/flametrench/spec/blob/main/CHANGELOG.md).
 
+## [v0.2.0] — 2026-04-30
+
+### Released
+- v0.2 stable cutoff. No functional changes from `v0.2.0-rc.4` — same source, version bumped to drop the `-rc` suffix at the spec v0.2.0 freeze. The `ids` dependency was bumped from `0.2.0-rc.2` to `0.2.0` to track the family. Includes the +5 share-store savepoint regression tests added at the cut. Maven Central publication is gated on Sonatype Central Portal credential regeneration; until that unblocks, the `0.2.0` jar is built and validated locally (`mvn -P release verify -Dgpg.skip=true`).
+
 ## [v0.2.0-rc.4] — 2026-04-27
 
 ### Fixed
