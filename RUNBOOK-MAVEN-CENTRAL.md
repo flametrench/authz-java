@@ -1,6 +1,8 @@
 # Maven Central Publishing Runbook
 
-This document describes how to publish `dev.flametrench:authz` to Maven Central. The same flow applies to `dev.flametrench:{authz,tenancy,identity}` — each is a sibling repo with the same `release` profile in its `pom.xml`.
+This document describes how to publish `dev.flametrench:authz` to Maven Central. The same flow applies to `dev.flametrench:{ids,identity,tenancy}` — each is a sibling repo with the same `release` profile in its `pom.xml`.
+
+For cross-ecosystem release process (per-package CHANGELOG, doc-surface sync, post-publish verification, the "stable" gating bar that applies regardless of language), see [`spec/docs/release-checklist.md`](https://github.com/flametrench/spec/blob/main/docs/release-checklist.md). The Maven Central flow below covers the Java-specific publishing mechanics; the spec checklist covers the broader release discipline.
 
 The pom's `release` profile wires four plugins: `maven-source-plugin` (sources jar), `maven-javadoc-plugin` (javadoc jar), `maven-gpg-plugin` (artifact signing), and `central-publishing-maven-plugin` (Sonatype Central Portal upload). Local dev builds don't activate the profile, so day-to-day work doesn't need GPG or a network round-trip.
 
