@@ -3,6 +3,7 @@
 
 package dev.flametrench.authz;
 
+import dev.flametrench.ids.DecodedId;
 import dev.flametrench.ids.Id;
 
 import javax.sql.DataSource;
@@ -158,8 +159,26 @@ public class PostgresTupleStore implements TupleStore {
      * UUID. Mirrors {@link #objectIdToUuid}.
      */
     private static UUID subjectIdToUuid(String subjectId) {
+        return subjectIdToUuid(subjectId, null);
+    }
+
+    /**
+     * security-audit-v0.3.md M9: when a {@code subjectType} is supplied,
+     * assert the wire-id's prefix matches it. Pre-fix this helper accepted
+     * any {@code <word>_<uuid>} string, so a caller passing a stale
+     * (subjectType, subjectId) pair where the id's prefix didn't match
+     * the type was silently coerced.
+     */
+    private static UUID subjectIdToUuid(String subjectId, String subjectType) {
         if (OBJECT_ID_WIRE.matcher(subjectId).matches()) {
-            return UUID.fromString(Id.decodeAny(subjectId).uuid());
+            DecodedId decoded = Id.decodeAny(subjectId);
+            if (subjectType != null && !decoded.type().equals(subjectType)) {
+                throw new InvalidFormatError(
+                        "subjectId " + subjectId + " prefix does not match subjectType " + subjectType,
+                        "subject_id"
+                );
+            }
+            return UUID.fromString(decoded.uuid());
         }
         if (subjectId.length() == 32) {
             return UUID.fromString(formatBareHex(subjectId));
@@ -254,7 +273,7 @@ public class PostgresTupleStore implements TupleStore {
     ) {
         validate(relation, objectType);
         UUID tupUuid = UUID.fromString(Id.decode(Id.generate("tup")).uuid());
-        UUID subjectUuid = subjectIdToUuid(subjectId);
+        UUID subjectUuid = subjectIdToUuid(subjectId, subjectType);
         UUID createdByUuid = createdBy != null ? UUID.fromString(wireToUuid(createdBy)) : null;
         Instant now = now();
         // ADR 0013: ON CONFLICT DO NOTHING avoids raising 23505 inside
@@ -323,7 +342,7 @@ public class PostgresTupleStore implements TupleStore {
 
     @Override
     public int cascadeRevokeSubject(String subjectType, String subjectId) {
-        UUID subjectUuid = subjectIdToUuid(subjectId);
+        UUID subjectUuid = subjectIdToUuid(subjectId, subjectType);
         try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "DELETE FROM tup WHERE subject_type = ? AND subject_id = ?")) {
@@ -384,7 +403,7 @@ public class PostgresTupleStore implements TupleStore {
         // `relation = ANY(?)` short-circuits the whole set in one round
         // trip. Preserves v0.2 behavior.
         if (this.rules == null) {
-            UUID subjectUuid = subjectIdToUuid(subjectId);
+            UUID subjectUuid = subjectIdToUuid(subjectId, subjectType);
             try (Connection conn = acquireConnection();
                  PreparedStatement ps = conn.prepareStatement(
                          "SELECT id FROM tup WHERE subject_type = ? AND subject_id = ?"
@@ -427,7 +446,7 @@ public class PostgresTupleStore implements TupleStore {
                      "SELECT id FROM tup WHERE subject_type = ? AND subject_id = ?"
                    + " AND relation = ? AND object_type = ? AND object_id = ? LIMIT 1")) {
             ps.setString(1, subjectType);
-            ps.setObject(2, subjectIdToUuid(subjectId));
+            ps.setObject(2, subjectIdToUuid(subjectId, subjectType));
             ps.setString(3, relation);
             ps.setString(4, objectType);
             ps.setObject(5, objectIdToUuid(objectId));
@@ -516,7 +535,7 @@ public class PostgresTupleStore implements TupleStore {
              PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             int idx = 1;
             ps.setString(idx++, subjectType);
-            ps.setObject(idx++, subjectIdToUuid(subjectId));
+            ps.setObject(idx++, subjectIdToUuid(subjectId, subjectType));
             if (cursor != null) {
                 ps.setObject(idx++, UUID.fromString(wireToUuid(cursor)));
             }
