@@ -375,17 +375,29 @@ public class PostgresTupleStore implements TupleStore {
         if (this.rules == null) {
             return CheckResult.denied();
         }
-        RewriteRulesEvaluator.EvaluationResult result = RewriteRulesEvaluator.evaluate(
-                this.rules,
-                subjectType, subjectId, relation, objectType, objectId,
-                this::directLookup,
-                this::listByObject,
-                this.maxDepth,
-                this.maxFanOut
-        );
-        return result.allowed()
-                ? CheckResult.allowed(result.matchedTupleId())
-                : CheckResult.denied();
+        // security-audit-v0.3.md M1: pin a single Connection for the
+        // whole rule-eval recursion. Pre-fix every directLookup /
+        // listByObject hop borrowed a fresh DataSource connection, so
+        // a deep tuple_to_userset chain could fan checkouts across
+        // one logical check. Bound to one connection now; read-skew is
+        // still possible under concurrent writers (documented as a
+        // v0.3 limitation in ADR 0017).
+        try (Connection conn = acquireConnection()) {
+            final Connection pinned = conn;
+            RewriteRulesEvaluator.EvaluationResult result = RewriteRulesEvaluator.evaluate(
+                    this.rules,
+                    subjectType, subjectId, relation, objectType, objectId,
+                    (st, si, r, ot, oi) -> directLookupOn(pinned, st, si, r, ot, oi),
+                    (ot, oi, r) -> listByObjectOn(pinned, ot, oi, r),
+                    this.maxDepth,
+                    this.maxFanOut
+            );
+            return result.allowed()
+                    ? CheckResult.allowed(result.matchedTupleId())
+                    : CheckResult.denied();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     @Override
@@ -431,8 +443,9 @@ public class PostgresTupleStore implements TupleStore {
     }
 
     /**
-     * Direct natural-key lookup against Postgres. Used by both the
-     * {@link #check} fast path and the rule evaluator's recursion.
+     * Direct natural-key lookup against Postgres — fast-path entry that
+     * borrows its own connection. The rule-eval recursion uses
+     * {@link #directLookupOn} with a connection pinned by {@link #check}.
      */
     private String directLookup(
             String subjectType,
@@ -441,10 +454,30 @@ public class PostgresTupleStore implements TupleStore {
             String objectType,
             String objectId
     ) {
-        try (Connection conn = acquireConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                     "SELECT id FROM tup WHERE subject_type = ? AND subject_id = ?"
-                   + " AND relation = ? AND object_type = ? AND object_id = ? LIMIT 1")) {
+        try (Connection conn = acquireConnection()) {
+            return directLookupOn(conn, subjectType, subjectId, relation, objectType, objectId);
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * security-audit-v0.3.md M1 — direct lookup against an explicit
+     * Connection. Rule-eval recursion calls this with one connection
+     * pinned for the whole evaluate(), so deep tuple_to_userset chains
+     * don't fan DataSource checkouts across one check.
+     */
+    private String directLookupOn(
+            Connection conn,
+            String subjectType,
+            String subjectId,
+            String relation,
+            String objectType,
+            String objectId
+    ) {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT id FROM tup WHERE subject_type = ? AND subject_id = ?"
+              + " AND relation = ? AND object_type = ? AND object_id = ? LIMIT 1")) {
             ps.setString(1, subjectType);
             ps.setObject(2, subjectIdToUuid(subjectId, subjectType));
             ps.setString(3, relation);
@@ -466,15 +499,14 @@ public class PostgresTupleStore implements TupleStore {
      * subject_type (e.g. {@code org_<hex>} for parent_org tuples), so
      * the evaluator can pass it through as the next-hop objectId.
      */
-    private List<RewriteRulesEvaluator.SubjectRef> listByObject(
-            String objectType, String objectId, String relation
+    private List<RewriteRulesEvaluator.SubjectRef> listByObjectOn(
+            Connection conn, String objectType, String objectId, String relation
     ) {
         StringBuilder sql = new StringBuilder(
                 "SELECT id, subject_type, subject_id FROM tup"
               + " WHERE object_type = ? AND object_id = ?");
         if (relation != null) sql.append(" AND relation = ?");
-        try (Connection conn = acquireConnection();
-             PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+        try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             ps.setString(1, objectType);
             ps.setObject(2, objectIdToUuid(objectId));
             if (relation != null) ps.setString(3, relation);
