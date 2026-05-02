@@ -55,15 +55,43 @@ public class PostgresTupleStore implements TupleStore {
     private final DataSource dataSource;
     private final Connection callerConnection;
     private final Clock clock;
+    /** v0.3 (ADR 0017): nullable rule registry; null => exact-match only. */
+    private final java.util.Map<String, java.util.Map<String, java.util.List<RuleNode>>> rules;
+    private final int maxDepth;
+    private final int maxFanOut;
 
     public PostgresTupleStore(DataSource dataSource) {
-        this(dataSource, Clock.systemUTC());
+        this(dataSource, Clock.systemUTC(), null,
+                RewriteRulesEvaluator.DEFAULT_MAX_DEPTH,
+                RewriteRulesEvaluator.DEFAULT_MAX_FAN_OUT);
     }
 
     public PostgresTupleStore(DataSource dataSource, Clock clock) {
+        this(dataSource, clock, null,
+                RewriteRulesEvaluator.DEFAULT_MAX_DEPTH,
+                RewriteRulesEvaluator.DEFAULT_MAX_FAN_OUT);
+    }
+
+    /**
+     * v0.3 (ADR 0017): full constructor accepting an optional rule
+     * registry. With {@code rules == null}, behavior is byte-identical
+     * to v0.2 (exact-match only). With rules, {@code check()}
+     * evaluates rewrite rules via iterative expansion against
+     * Postgres — same algorithm InMemoryTupleStore uses.
+     */
+    public PostgresTupleStore(
+            DataSource dataSource,
+            Clock clock,
+            java.util.Map<String, java.util.Map<String, java.util.List<RuleNode>>> rules,
+            int maxDepth,
+            int maxFanOut
+    ) {
         this.dataSource = dataSource;
         this.callerConnection = null;
         this.clock = clock;
+        this.rules = rules;
+        this.maxDepth = maxDepth;
+        this.maxFanOut = maxFanOut;
     }
 
     /**
@@ -72,13 +100,30 @@ public class PostgresTupleStore implements TupleStore {
      * queries to that connection (no close on end-of-try).
      */
     public PostgresTupleStore(Connection callerConnection) {
-        this(callerConnection, Clock.systemUTC());
+        this(callerConnection, Clock.systemUTC(), null,
+                RewriteRulesEvaluator.DEFAULT_MAX_DEPTH,
+                RewriteRulesEvaluator.DEFAULT_MAX_FAN_OUT);
     }
 
     public PostgresTupleStore(Connection callerConnection, Clock clock) {
+        this(callerConnection, clock, null,
+                RewriteRulesEvaluator.DEFAULT_MAX_DEPTH,
+                RewriteRulesEvaluator.DEFAULT_MAX_FAN_OUT);
+    }
+
+    public PostgresTupleStore(
+            Connection callerConnection,
+            Clock clock,
+            java.util.Map<String, java.util.Map<String, java.util.List<RuleNode>>> rules,
+            int maxDepth,
+            int maxFanOut
+    ) {
         this.dataSource = null;
         this.callerConnection = callerConnection;
         this.clock = clock;
+        this.rules = rules;
+        this.maxDepth = maxDepth;
+        this.maxFanOut = maxFanOut;
     }
 
     private Connection acquireConnection() throws SQLException {
@@ -105,6 +150,33 @@ public class PostgresTupleStore implements TupleStore {
 
     private static final java.util.regex.Pattern OBJECT_ID_WIRE =
             java.util.regex.Pattern.compile("^[a-z]{2,6}_[0-9a-f]{32}$");
+
+    /**
+     * v0.3 (ADR 0017) — accept subject ids in any of three shapes:
+     * wire format with usr_, wire format with any registered prefix
+     * (org_<hex> for tuple_to_userset parent hops), or bare canonical
+     * UUID. Mirrors {@link #objectIdToUuid}.
+     */
+    private static UUID subjectIdToUuid(String subjectId) {
+        if (OBJECT_ID_WIRE.matcher(subjectId).matches()) {
+            return UUID.fromString(Id.decodeAny(subjectId).uuid());
+        }
+        if (subjectId.length() == 32) {
+            return UUID.fromString(formatBareHex(subjectId));
+        }
+        return UUID.fromString(subjectId);
+    }
+
+    private static String formatBareHex(String s) {
+        return s.substring(0, 8) + "-" + s.substring(8, 12)
+                + "-" + s.substring(12, 16) + "-" + s.substring(16, 20)
+                + "-" + s.substring(20);
+    }
+
+    /** UUID 01234567-89ab-... → bare 32-hex 0123456789ab... */
+    private static String uuidHyphensToBare(String hyphenated) {
+        return hyphenated.replace("-", "");
+    }
 
     /**
      * Decode an {@code object_id} to a Postgres-bindable UUID. Accepts:
@@ -182,7 +254,7 @@ public class PostgresTupleStore implements TupleStore {
     ) {
         validate(relation, objectType);
         UUID tupUuid = UUID.fromString(Id.decode(Id.generate("tup")).uuid());
-        UUID subjectUuid = UUID.fromString(wireToUuid(subjectId));
+        UUID subjectUuid = subjectIdToUuid(subjectId);
         UUID createdByUuid = createdBy != null ? UUID.fromString(wireToUuid(createdBy)) : null;
         Instant now = now();
         // ADR 0013: ON CONFLICT DO NOTHING avoids raising 23505 inside
@@ -251,7 +323,7 @@ public class PostgresTupleStore implements TupleStore {
 
     @Override
     public int cascadeRevokeSubject(String subjectType, String subjectId) {
-        UUID subjectUuid = UUID.fromString(wireToUuid(subjectId));
+        UUID subjectUuid = subjectIdToUuid(subjectId);
         try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "DELETE FROM tup WHERE subject_type = ? AND subject_id = ?")) {
@@ -273,7 +345,28 @@ public class PostgresTupleStore implements TupleStore {
             String objectType,
             String objectId
     ) {
-        return checkAny(subjectType, subjectId, List.of(relation), objectType, objectId);
+        // v0.1 fast path: direct natural-key lookup.
+        String direct = directLookup(subjectType, subjectId, relation, objectType, objectId);
+        if (direct != null) {
+            return CheckResult.allowed(direct);
+        }
+        // ADR 0017 path: rule expansion only on direct miss AND when
+        // rules are registered. With rules=null, behavior is byte-
+        // identical to v0.2.
+        if (this.rules == null) {
+            return CheckResult.denied();
+        }
+        RewriteRulesEvaluator.EvaluationResult result = RewriteRulesEvaluator.evaluate(
+                this.rules,
+                subjectType, subjectId, relation, objectType, objectId,
+                this::directLookup,
+                this::listByObject,
+                this.maxDepth,
+                this.maxFanOut
+        );
+        return result.allowed()
+                ? CheckResult.allowed(result.matchedTupleId())
+                : CheckResult.denied();
     }
 
     @Override
@@ -287,22 +380,97 @@ public class PostgresTupleStore implements TupleStore {
         if (relations == null || relations.isEmpty()) {
             throw new EmptyRelationSetError();
         }
-        UUID subjectUuid = UUID.fromString(wireToUuid(subjectId));
+        // Fast path: when no rules are registered, a single SELECT with
+        // `relation = ANY(?)` short-circuits the whole set in one round
+        // trip. Preserves v0.2 behavior.
+        if (this.rules == null) {
+            UUID subjectUuid = subjectIdToUuid(subjectId);
+            try (Connection conn = acquireConnection();
+                 PreparedStatement ps = conn.prepareStatement(
+                         "SELECT id FROM tup WHERE subject_type = ? AND subject_id = ?"
+                       + " AND relation = ANY(?) AND object_type = ? AND object_id = ? LIMIT 1")) {
+                Array relArray = conn.createArrayOf("text", relations.toArray(new String[0]));
+                ps.setString(1, subjectType);
+                ps.setObject(2, subjectUuid);
+                ps.setArray(3, relArray);
+                ps.setString(4, objectType);
+                ps.setObject(5, objectIdToUuid(objectId));
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return CheckResult.denied();
+                    return CheckResult.allowed(Id.encode("tup", rs.getString("id")));
+                }
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        // With rules, evaluate each relation in turn until first match.
+        for (String relation : relations) {
+            CheckResult r = check(subjectType, subjectId, relation, objectType, objectId);
+            if (r.allowed()) return r;
+        }
+        return CheckResult.denied();
+    }
+
+    /**
+     * Direct natural-key lookup against Postgres. Used by both the
+     * {@link #check} fast path and the rule evaluator's recursion.
+     */
+    private String directLookup(
+            String subjectType,
+            String subjectId,
+            String relation,
+            String objectType,
+            String objectId
+    ) {
         try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT id FROM tup WHERE subject_type = ? AND subject_id = ?"
-                   + " AND relation = ANY(?) AND object_type = ? AND object_id = ? LIMIT 1")) {
-            Array relArray = conn.createArrayOf("text", relations.toArray(new String[0]));
+                   + " AND relation = ? AND object_type = ? AND object_id = ? LIMIT 1")) {
             ps.setString(1, subjectType);
-            ps.setObject(2, subjectUuid);
-            ps.setArray(3, relArray);
+            ps.setObject(2, subjectIdToUuid(subjectId));
+            ps.setString(3, relation);
             ps.setString(4, objectType);
             ps.setObject(5, objectIdToUuid(objectId));
             try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) {
-                    return CheckResult.denied();
+                if (!rs.next()) return null;
+                return Id.encode("tup", rs.getString("id"));
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Enumerate tuples on (object, relation). Used by tuple_to_userset.
+     *
+     * <p>Returned subjectId is wire-format prefixed with the row's
+     * subject_type (e.g. {@code org_<hex>} for parent_org tuples), so
+     * the evaluator can pass it through as the next-hop objectId.
+     */
+    private List<RewriteRulesEvaluator.SubjectRef> listByObject(
+            String objectType, String objectId, String relation
+    ) {
+        StringBuilder sql = new StringBuilder(
+                "SELECT id, subject_type, subject_id FROM tup"
+              + " WHERE object_type = ? AND object_id = ?");
+        if (relation != null) sql.append(" AND relation = ?");
+        try (Connection conn = acquireConnection();
+             PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+            ps.setString(1, objectType);
+            ps.setObject(2, objectIdToUuid(objectId));
+            if (relation != null) ps.setString(3, relation);
+            try (ResultSet rs = ps.executeQuery()) {
+                List<RewriteRulesEvaluator.SubjectRef> out = new java.util.ArrayList<>();
+                while (rs.next()) {
+                    String subType = rs.getString("subject_type");
+                    String subIdHex = uuidHyphensToBare(rs.getString("subject_id"));
+                    out.add(new RewriteRulesEvaluator.SubjectRef(
+                            subType,
+                            subType + "_" + subIdHex,
+                            Id.encode("tup", rs.getString("id"))
+                    ));
                 }
-                return CheckResult.allowed(Id.encode("tup", rs.getString("id")));
+                return out;
             }
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -348,7 +516,7 @@ public class PostgresTupleStore implements TupleStore {
              PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             int idx = 1;
             ps.setString(idx++, subjectType);
-            ps.setObject(idx++, UUID.fromString(wireToUuid(subjectId)));
+            ps.setObject(idx++, subjectIdToUuid(subjectId));
             if (cursor != null) {
                 ps.setObject(idx++, UUID.fromString(wireToUuid(cursor)));
             }

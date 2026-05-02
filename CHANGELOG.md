@@ -3,6 +3,24 @@
 All notable changes to `dev.flametrench:authz` are recorded here.
 Spec-level changes live in [`spec/CHANGELOG.md`](https://github.com/flametrench/spec/blob/main/CHANGELOG.md).
 
+## [v0.3.0] — Unreleased (Maven Central publish blocked)
+
+### Added (Postgres rewrite-rule evaluation, ADR 0017)
+- New 5-arg `PostgresTupleStore` constructors accepting an optional rule registry, `maxDepth`, and `maxFanOut` (mirrors `InMemoryTupleStore`). With `rules == null`, behavior is byte-identical to v0.2 (single SELECT with `relation = ANY(?)` for `checkAny` fast path).
+- With rules, `check()` evaluates rewrite rules via iterative expansion against Postgres — same algorithm `InMemoryTupleStore` uses (cycle detection, depth + fan-out bounds, short-circuit semantics from ADR 0007 unchanged).
+- New `subjectIdToUuid` helper accepts wire-format ids with any registered prefix (e.g. `org_<hex>`), not just `usr_<hex>`. Required for `tuple_to_userset` patterns where the parent hop is a non-`usr` object.
+- New `uuidHyphensToBare` helper for round-tripping JDBC's hyphenated UUID return shape back to wire format.
+- 10 new tests in `PostgresRewriteRulesTest` mirroring the in-memory rewrite-rule tests against the live Postgres adapter.
+
+### Test infrastructure
+- `src/test/resources/postgres-schema.sql` re-synced from spec `reference/postgres.sql` to pick up the relaxed `tup.subject_type` constraint (now `^[a-z]{2,6}$` per ADR 0017 follow-up). Lifting the v0.1/v0.2 `subject_type IN ('usr')` constraint is additive.
+
+### Required dependency bump
+- `dev.flametrench:ids` constraint now `0.3.0` to track the v0.3 family.
+
+### Release status
+- Tagged in lockstep with the Node and PHP v0.3.0 cuts; Maven Central publication remains externally blocked. Local install via `mvn install -DskipTests` works for downstream consumers.
+
 ## [v0.2.0] — 2026-04-30
 
 ### Released
