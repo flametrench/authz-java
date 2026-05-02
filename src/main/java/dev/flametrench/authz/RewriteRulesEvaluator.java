@@ -132,8 +132,12 @@ public final class RewriteRulesEvaluator {
             );
         }
 
-        Set<String> newStack = new HashSet<>(stack);
-        newStack.add(frameKey);
+        // security-audit-v0.3.md M7: pre-fix this allocated a fresh
+        // HashSet copy at every recursion (O(N) per call). For a
+        // worst-case spec-legal rule (depth=8, fan-out=1024), that's
+        // ~8K hash copies per check(). Mutate the same Set in-place
+        // and undo on return — same semantics, O(1) per call.
+        stack.add(frameKey);
 
         for (RuleNode node : rule) {
             if (node instanceof ThisNode) {
@@ -144,10 +148,13 @@ public final class RewriteRulesEvaluator {
                         rules, subjectType, subjectId,
                         cu.relation(), objectType, objectId,
                         directLookup, listByObject,
-                        newStack, depth + 1,
+                        stack, depth + 1,
                         maxDepth, maxFanOut
                 );
-                if (r.allowed()) return r;
+                if (r.allowed()) {
+                    stack.remove(frameKey);
+                    return r;
+                }
                 continue;
             }
             if (node instanceof TupleToUserset ttu) {
@@ -167,16 +174,20 @@ public final class RewriteRulesEvaluator {
                             ttu.computedUsersetRelation(),
                             ref.subjectType(), ref.subjectId(),
                             directLookup, listByObject,
-                            newStack, depth + 1,
+                            stack, depth + 1,
                             maxDepth, maxFanOut
                     );
-                    if (r.allowed()) return r;
+                    if (r.allowed()) {
+                        stack.remove(frameKey);
+                        return r;
+                    }
                 }
                 continue;
             }
             throw new IllegalStateException("Unknown rule node: " + node.getClass());
         }
 
+        stack.remove(frameKey);
         return new EvaluationResult(false, null);
     }
 }
