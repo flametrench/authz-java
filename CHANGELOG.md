@@ -3,7 +3,7 @@
 All notable changes to `dev.flametrench:authz` are recorded here.
 Spec-level changes live in [`spec/CHANGELOG.md`](https://github.com/flametrench/spec/blob/main/CHANGELOG.md).
 
-## [v0.3.0] — Unreleased (Maven Central publish blocked)
+## [v0.3.0] — 2026-05-15 (tagged; Maven Central publish pending Sonatype Central Portal credential regen)
 
 ### Added (Postgres rewrite-rule evaluation, ADR 0017)
 - New 5-arg `PostgresTupleStore` constructors accepting an optional rule registry, `maxDepth`, and `maxFanOut` (mirrors `InMemoryTupleStore`). With `rules == null`, behavior is byte-identical to v0.2 (single SELECT with `relation = ANY(?)` for `checkAny` fast path).
