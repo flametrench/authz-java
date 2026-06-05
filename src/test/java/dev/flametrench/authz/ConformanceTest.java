@@ -7,9 +7,15 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.TestFactory;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+import org.postgresql.ds.PGSimpleDataSource;
 
+import javax.sql.DataSource;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
+import java.sql.Connection;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -50,6 +56,10 @@ class ConformanceTest {
     }
 
     private static void seed(InMemoryTupleStore store, JsonNode given) {
+        seed((TupleStore) store, given);
+    }
+
+    private static void seed(TupleStore store, JsonNode given) {
         for (JsonNode t : given) {
             store.createTuple(
                     t.get("subject_type").asText(),
@@ -258,5 +268,77 @@ class ConformanceTest {
     @TestFactory
     List<DynamicTest> rewriteEmptyRulesEqualsV01Conformance() throws IOException {
         return rewriteFixtureBlock("empty-rules-equals-v01.json");
+    }
+
+    // ─── v0.3: Postgres-backed rewrite-rule conformance (ADR 0017) ───
+    // Gated on AUTHZ_POSTGRES_URL — same fixture corpus, PostgresTupleStore backend.
+
+    private static DataSource buildDataSource() {
+        String url = System.getenv("AUTHZ_POSTGRES_URL");
+        URI uri = URI.create(url.replaceFirst("^postgresql:", "http:"));
+        PGSimpleDataSource ds = new PGSimpleDataSource();
+        ds.setServerNames(new String[]{ uri.getHost() });
+        ds.setPortNumbers(new int[]{ uri.getPort() > 0 ? uri.getPort() : 5432 });
+        String path = uri.getPath();
+        ds.setDatabaseName(path != null && path.length() > 1 ? path.substring(1) : "postgres");
+        if (uri.getUserInfo() != null) {
+            String[] ui = uri.getUserInfo().split(":", 2);
+            ds.setUser(ui[0]);
+            if (ui.length > 1) ds.setPassword(ui[1]);
+        }
+        return ds;
+    }
+
+    private List<DynamicTest> rewriteFixtureBlockPostgres(String fixtureName) throws IOException {
+        DataSource ds = buildDataSource();
+        String schemaSql;
+        try (InputStream in = ConformanceTest.class.getResourceAsStream("/postgres-schema.sql")) {
+            schemaSql = new String(in.readAllBytes());
+        }
+        JsonNode fixture = loadFixture("authorization/rewrite-rules/" + fixtureName);
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[postgres][" + id + "] " + desc, () -> {
+                Map<String, Map<String, List<RuleNode>>> rules = parseRules(t.get("rules"));
+                PostgresTupleStore store = rules != null
+                        ? new PostgresTupleStore(ds, rules)
+                        : new PostgresTupleStore(ds);
+                try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
+                    stmt.execute(schemaSql);
+                }
+                seed(store, t.get("input").get("given_tuples"));
+                JsonNode c = t.get("input").get("check");
+                CheckResult result = store.check(
+                        c.get("subject_type").asText(),
+                        c.get("subject_id").asText(),
+                        c.get("relation").asText(),
+                        c.get("object_type").asText(),
+                        c.get("object_id").asText()
+                );
+                JsonNode expected = t.get("expected").get("result");
+                assertEquals(expected.get("allowed").asBoolean(), result.allowed());
+            }));
+        }
+        return tests;
+    }
+
+    @TestFactory
+    @EnabledIfEnvironmentVariable(named = "AUTHZ_POSTGRES_URL", matches = ".+")
+    List<DynamicTest> rewriteComputedUsersetPostgresConformance() throws IOException {
+        return rewriteFixtureBlockPostgres("computed-userset.json");
+    }
+
+    @TestFactory
+    @EnabledIfEnvironmentVariable(named = "AUTHZ_POSTGRES_URL", matches = ".+")
+    List<DynamicTest> rewriteTupleToUsersetPostgresConformance() throws IOException {
+        return rewriteFixtureBlockPostgres("tuple-to-userset.json");
+    }
+
+    @TestFactory
+    @EnabledIfEnvironmentVariable(named = "AUTHZ_POSTGRES_URL", matches = ".+")
+    List<DynamicTest> rewriteEmptyRulesEqualsV01PostgresConformance() throws IOException {
+        return rewriteFixtureBlockPostgres("empty-rules-equals-v01.json");
     }
 }
