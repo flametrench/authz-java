@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.sql.Connection;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -289,11 +290,15 @@ class ConformanceTest {
         return ds;
     }
 
-    private List<DynamicTest> rewriteFixtureBlockPostgres(String fixtureName) throws IOException {
+    private List<DynamicTest> rewriteFixtureBlockPostgres(String fixtureName) throws IOException, SQLException {
         DataSource ds = buildDataSource();
-        String schemaSql;
-        try (InputStream in = ConformanceTest.class.getResourceAsStream("/postgres-schema.sql")) {
-            schemaSql = new String(in.readAllBytes());
+        String testSchemaSql;
+        try (InputStream in = ConformanceTest.class.getResourceAsStream("/authz-test-schema.sql")) {
+            testSchemaSql = new String(in.readAllBytes());
+        }
+        // Apply schema once before any test runs — idempotent (DROP TABLE IF EXISTS tup CASCADE)
+        try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute(testSchemaSql);
         }
         JsonNode fixture = loadFixture("authorization/rewrite-rules/" + fixtureName);
         List<DynamicTest> tests = new ArrayList<>();
@@ -301,13 +306,14 @@ class ConformanceTest {
             String id = t.get("id").asText();
             String desc = t.get("description").asText();
             tests.add(DynamicTest.dynamicTest("[postgres][" + id + "] " + desc, () -> {
+                // Isolate data per test case
+                try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
+                    stmt.execute("TRUNCATE tup");
+                }
                 Map<String, Map<String, List<RuleNode>>> rules = parseRules(t.get("rules"));
                 PostgresTupleStore store = rules != null
                         ? new PostgresTupleStore(ds, rules)
                         : new PostgresTupleStore(ds);
-                try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
-                    stmt.execute(schemaSql);
-                }
                 seed(store, t.get("input").get("given_tuples"));
                 JsonNode c = t.get("input").get("check");
                 CheckResult result = store.check(
@@ -326,19 +332,19 @@ class ConformanceTest {
 
     @TestFactory
     @EnabledIfEnvironmentVariable(named = "AUTHZ_POSTGRES_URL", matches = ".+")
-    List<DynamicTest> rewriteComputedUsersetPostgresConformance() throws IOException {
+    List<DynamicTest> rewriteComputedUsersetPostgresConformance() throws IOException, SQLException {
         return rewriteFixtureBlockPostgres("computed-userset.json");
     }
 
     @TestFactory
     @EnabledIfEnvironmentVariable(named = "AUTHZ_POSTGRES_URL", matches = ".+")
-    List<DynamicTest> rewriteTupleToUsersetPostgresConformance() throws IOException {
+    List<DynamicTest> rewriteTupleToUsersetPostgresConformance() throws IOException, SQLException {
         return rewriteFixtureBlockPostgres("tuple-to-userset.json");
     }
 
     @TestFactory
     @EnabledIfEnvironmentVariable(named = "AUTHZ_POSTGRES_URL", matches = ".+")
-    List<DynamicTest> rewriteEmptyRulesEqualsV01PostgresConformance() throws IOException {
+    List<DynamicTest> rewriteEmptyRulesEqualsV01PostgresConformance() throws IOException, SQLException {
         return rewriteFixtureBlockPostgres("empty-rules-equals-v01.json");
     }
 }
