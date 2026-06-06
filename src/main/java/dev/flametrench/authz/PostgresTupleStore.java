@@ -193,12 +193,13 @@ public class PostgresTupleStore implements TupleStore {
 
     private static Tuple rowToTuple(ResultSet rs) throws SQLException {
         String tupUuid = rs.getString("id");
+        String subjectType = rs.getString("subject_type");
         String subjectUuid = rs.getString("subject_id");
         String createdByUuid = rs.getString("created_by");
         return new Tuple(
                 Id.encode("tup", tupUuid),
-                rs.getString("subject_type"),
-                Id.encode("usr", subjectUuid),
+                subjectType,
+                Id.encode(subjectType, subjectUuid),
                 rs.getString("relation"),
                 rs.getString("object_type"),
                 rs.getString("object_id"),
@@ -220,7 +221,7 @@ public class PostgresTupleStore implements TupleStore {
     ) {
         validate(relation, objectType);
         UUID tupUuid = UUID.fromString(Id.decode(Id.generate("tup")).uuid());
-        UUID subjectUuid = UUID.fromString(wireToUuid(subjectId));
+        UUID subjectUuid = objectIdToUuid(subjectId);
         UUID createdByUuid = createdBy != null ? UUID.fromString(wireToUuid(createdBy)) : null;
         Instant now = now();
         // ADR 0013: ON CONFLICT DO NOTHING avoids raising 23505 inside
@@ -289,7 +290,7 @@ public class PostgresTupleStore implements TupleStore {
 
     @Override
     public int cascadeRevokeSubject(String subjectType, String subjectId) {
-        UUID subjectUuid = UUID.fromString(wireToUuid(subjectId));
+        UUID subjectUuid = objectIdToUuid(subjectId);
         try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "DELETE FROM tup WHERE subject_type = ? AND subject_id = ?")) {
@@ -310,7 +311,7 @@ public class PostgresTupleStore implements TupleStore {
         UUID subjectUuid;
         UUID objectUuid;
         try {
-            subjectUuid = UUID.fromString(wireToUuid(subjectId));
+            subjectUuid = objectIdToUuid(subjectId);
             objectUuid = objectIdToUuid(objectId);
         } catch (Exception e) {
             return null;
@@ -412,7 +413,7 @@ public class PostgresTupleStore implements TupleStore {
         }
         // Fast path: no rules — single SQL query with relation = ANY.
         if (rules == null) {
-            UUID subjectUuid = UUID.fromString(wireToUuid(subjectId));
+            UUID subjectUuid = objectIdToUuid(subjectId);
             try (Connection conn = acquireConnection();
                  PreparedStatement ps = conn.prepareStatement(
                          "SELECT id FROM tup WHERE subject_type = ? AND subject_id = ?"
@@ -478,7 +479,7 @@ public class PostgresTupleStore implements TupleStore {
              PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             int idx = 1;
             ps.setString(idx++, subjectType);
-            ps.setObject(idx++, UUID.fromString(wireToUuid(subjectId)));
+            ps.setObject(idx++, objectIdToUuid(subjectId));
             if (cursor != null) {
                 ps.setObject(idx++, UUID.fromString(wireToUuid(cursor)));
             }
