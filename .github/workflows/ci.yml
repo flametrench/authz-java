@@ -40,11 +40,11 @@ jobs:
 
       - name: Checkout flametrench/ids-java
         # Build ids from source so CI never resolves siblings from Maven Central.
-        # Ref: v0.2.0 (stable, matches pom ids:0.2.0 requirement).
+        # Ref: main (ids v0.3.0, QA-passed). Update to a tag once v0.3.0 is tagged.
         uses: actions/checkout@v4
         with:
           repository: flametrench/ids-java
-          ref: v0.2.0
+          ref: main
           path: _vendored/ids-java
 
       - name: Setup Java
