@@ -39,12 +39,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Checkout flametrench/ids-java
-        # Bootstrap the upstream `ids` dep at the version the pom pins
-        # (0.2.0-rc.2) until v0.2.x is published to Maven Central.
+        # Build ids from source so CI never resolves siblings from Maven Central.
+        # Ref: main (ids v0.3.0, QA-passed). Update to a tag once v0.3.0 is tagged.
         uses: actions/checkout@v4
         with:
           repository: flametrench/ids-java
-          ref: v0.2.0-rc.2
+          ref: main
           path: _vendored/ids-java
 
       - name: Setup Java
